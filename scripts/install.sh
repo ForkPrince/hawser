@@ -2,9 +2,10 @@
 set -e
 
 # Hawser Installation Script
-# Usage: curl -fsSL https://raw.githubusercontent.com/Finsys/hawser/main/scripts/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/ForkPrince/hawser/main/scripts/install.sh | bash
 
 VERSION="${HAWSER_VERSION:-latest}"
+REPO="${HAWSER_REPO:-ForkPrince/hawser}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 CONFIG_DIR="/etc/hawser"
 
@@ -22,38 +23,75 @@ case "$ARCH" in
     armv7l|armv7|arm)
         ARCH="arm"
         ;;
+    riscv64|riscv64le)
+        ARCH="riscv64"
+        ;;
     *)
         echo "Unsupported architecture: $ARCH"
         exit 1
         ;;
 esac
 
-echo "Installing Hawser for ${OS}/${ARCH}..."
+# Detect container runtime (Docker or Podman)
+if [ -n "${HAWSER_CONTAINER_RUNTIME:-}" ]; then
+    CONTAINER_RUNTIME="$HAWSER_CONTAINER_RUNTIME"
+elif [ -S /var/run/docker.sock ]; then
+    CONTAINER_RUNTIME="docker"
+elif command -v podman &> /dev/null; then
+    CONTAINER_RUNTIME="podman"
+else
+    CONTAINER_RUNTIME="docker"
+fi
+
+if [ "$CONTAINER_RUNTIME" = "podman" ]; then
+    if [ -S /run/podman/podman.sock ]; then
+        DOCKER_SOCKET="/run/podman/podman.sock"
+    elif [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "$XDG_RUNTIME_DIR/podman/podman.sock" ]; then
+        DOCKER_SOCKET="$XDG_RUNTIME_DIR/podman/podman.sock"
+    else
+        DOCKER_SOCKET="/run/podman/podman.sock"
+    fi
+    RUNTIME_UNIT="podman.socket"
+else
+    CONTAINER_RUNTIME="docker"
+    DOCKER_SOCKET="/var/run/docker.sock"
+    RUNTIME_UNIT="docker.service"
+fi
+
+echo "Installing Hawser for ${OS}/${ARCH} (runtime: ${CONTAINER_RUNTIME})..."
 
 # Determine download URL
-if [ "$VERSION" = "latest" ]; then
+if [ "$ARCH" = "riscv64" ]; then
+    # RISC-V builds are published by build-dev.yml as a raw binary on the
+    # "latest" tag (no tarball archive).
+    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/latest/hawser-linux-riscv64"
+elif [ "$VERSION" = "latest" ]; then
     # Fetch the latest release version from GitHub API
-    LATEST_VERSION=$(curl -fsSL "https://api.github.com/repos/Finsys/hawser/releases/latest" | grep '"tag_name"' | sed -E 's/.*"tag_name": "v?([^"]+)".*/\1/')
+    LATEST_VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | sed -E 's/.*"tag_name": "v?([^"]+)".*/\1/')
     if [ -z "$LATEST_VERSION" ]; then
         echo "Error: Could not determine latest version"
         exit 1
     fi
     echo "Latest version: $LATEST_VERSION"
-    DOWNLOAD_URL="https://github.com/Finsys/hawser/releases/download/v${LATEST_VERSION}/hawser_${LATEST_VERSION}_${OS}_${ARCH}.tar.gz"
+    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${LATEST_VERSION}/hawser_${LATEST_VERSION}_${OS}_${ARCH}.tar.gz"
 else
     # Remove 'v' prefix if present
     VERSION_NUM="${VERSION#v}"
-    DOWNLOAD_URL="https://github.com/Finsys/hawser/releases/download/v${VERSION_NUM}/hawser_${VERSION_NUM}_${OS}_${ARCH}.tar.gz"
+    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION_NUM}/hawser_${VERSION_NUM}_${OS}_${ARCH}.tar.gz"
 fi
 
 # Create temporary directory
 TMP_DIR=$(mktemp -d)
 trap "rm -rf $TMP_DIR" EXIT
 
-# Download and extract
+# Download (and extract, for tarball releases)
 echo "Downloading from $DOWNLOAD_URL..."
-curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/hawser.tar.gz"
-tar -xzf "$TMP_DIR/hawser.tar.gz" -C "$TMP_DIR"
+if [ "$ARCH" = "riscv64" ]; then
+    curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/hawser"
+else
+    curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/hawser.tar.gz"
+    tar -xzf "$TMP_DIR/hawser.tar.gz" -C "$TMP_DIR"
+fi
 
 # Install binary
 echo "Installing binary to $INSTALL_DIR..."
@@ -70,12 +108,12 @@ sudo mkdir -p /data/stacks
 # Create default config file if it doesn't exist
 if [ ! -f "$CONFIG_DIR/config" ]; then
     echo "Creating default config file..."
-    sudo tee "$CONFIG_DIR/config" > /dev/null << 'EOF'
+    sudo tee "$CONFIG_DIR/config" > /dev/null << EOF
 # Hawser Configuration
-# See https://github.com/Finsys/hawser for documentation
+# See https://github.com/ForkPrince/hawser for documentation
 
-# Docker socket path
-DOCKER_SOCKET=/var/run/docker.sock
+# Container socket path (${CONTAINER_RUNTIME})
+DOCKER_SOCKET=${DOCKER_SOCKET}
 
 #################### Standard Mode (comment out for Edge mode) ####################
 PORT=2376
@@ -112,14 +150,14 @@ sudo chmod 600 "$CONFIG_DIR/config"
 
 # Install systemd service if systemd is available
 if command -v systemctl &> /dev/null; then
-    echo "Installing systemd service..."
-    sudo tee /etc/systemd/system/hawser.service > /dev/null << 'EOF'
+    echo "Installing systemd service (${CONTAINER_RUNTIME})..."
+    sudo tee /etc/systemd/system/hawser.service > /dev/null << EOF
 [Unit]
 Description=Hawser - Remote Docker Agent for Dockhand
-Documentation=https://github.com/Finsys/hawser
-After=network-online.target docker.service
-Wants=network-online.target
-Requires=docker.service
+Documentation=https://github.com/ForkPrince/hawser
+After=network-online.target ${RUNTIME_UNIT}
+Wants=network-online.target ${RUNTIME_UNIT}
+Requires=${RUNTIME_UNIT}
 
 [Service]
 Type=simple
@@ -132,18 +170,23 @@ EnvironmentFile=/etc/hawser/config
 NoNewPrivileges=false
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/run/docker.sock /data/stacks
+ReadWritePaths=${DOCKER_SOCKET} /data/stacks
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    if [ "$CONTAINER_RUNTIME" = "podman" ]; then
+        # Root Podman socket is created by the socket unit
+        sudo systemctl enable --now podman.socket > /dev/null 2>&1 || true
+    fi
 
     echo "Reloading systemd..."
     sudo systemctl daemon-reload
     INIT_SYSTEM="systemd"
 elif command -v rc-service &> /dev/null; then
     # OpenRC (Alpine Linux)
-    echo "Installing OpenRC service..."
+    echo "Installing OpenRC service (${CONTAINER_RUNTIME})..."
 
     # Create wrapper script that sources config and runs hawser
     sudo tee /usr/local/bin/hawser-wrapper > /dev/null << 'EOF'
@@ -159,19 +202,25 @@ EOF
     sudo chmod +x /usr/local/bin/hawser-wrapper
 
     # Create init script that uses the wrapper
-    sudo tee /etc/init.d/hawser > /dev/null << 'EOF'
+    if [ "$CONTAINER_RUNTIME" = "podman" ]; then
+        OPENRC_DEPEND="need net
+    after podman"
+    else
+        OPENRC_DEPEND="need net docker
+    after docker"
+    fi
+    sudo tee /etc/init.d/hawser > /dev/null << EOF
 #!/sbin/openrc-run
 
 name="hawser"
 description="Hawser - Remote Docker Agent for Dockhand"
 command="/usr/local/bin/hawser-wrapper"
 command_background="yes"
-pidfile="/run/${RC_SVCNAME}.pid"
+pidfile="/run/\${RC_SVCNAME}.pid"
 start_stop_daemon_args="--stdout /var/log/hawser.log --stderr /var/log/hawser.log"
 
 depend() {
-    need net docker
-    after docker
+    ${OPENRC_DEPEND}
 }
 EOF
     sudo chmod +x /etc/init.d/hawser
