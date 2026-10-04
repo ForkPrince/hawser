@@ -166,7 +166,7 @@ func (c *Config) validate() error {
 	// Validate docker socket exists (if using socket)
 	if c.DockerHost == "" {
 		if _, err := os.Stat(c.DockerSocket); os.IsNotExist(err) {
-			return fmt.Errorf("Docker socket not found at %s", c.DockerSocket)
+			return fmt.Errorf("container socket not found at %s (set DOCKER_SOCKET, e.g. /var/run/docker.sock or /run/podman/podman.sock)", c.DockerSocket)
 		}
 	}
 
@@ -191,6 +191,15 @@ func isLoopbackBind(addr string) bool {
 	return ip.IsLoopback()
 }
 
+// xdgRuntimePodmanSocket returns the rootless podman socket for the current
+// user, or "" when XDG_RUNTIME_DIR is unset.
+func xdgRuntimePodmanSocket() string {
+	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
+		return xdg + "/podman/podman.sock"
+	}
+	return ""
+}
+
 func detectDockerSocket() string {
 	// Check common socket paths
 	paths := []string{
@@ -198,11 +207,15 @@ func detectDockerSocket() string {
 		os.Getenv("HOME") + "/.docker/run/docker.sock",   // Docker Desktop Mac
 		os.Getenv("HOME") + "/.orbstack/run/docker.sock", // OrbStack
 		"/run/docker.sock",                               // Alternative Linux
+		"/run/podman/podman.sock",                        // Podman (rootful)
+		xdgRuntimePodmanSocket(),                         // Podman (rootless)
 	}
 
 	for _, path := range paths {
-		if _, err := os.Stat(path); err == nil {
-			return path
+		if path != "" {
+			if _, err := os.Stat(path); err == nil {
+				return path
+			}
 		}
 	}
 

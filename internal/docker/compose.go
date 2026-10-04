@@ -33,6 +33,9 @@ var deniedEnvKeys = map[string]bool{
 	"DOCKER_CERT_PATH": true,
 	"DOCKER_TLS_VERIFY": true,
 	"DOCKER_CONTEXT":  true,
+	"CONTAINER_HOST":     true,
+	"CONTAINER_CONNECTION": true,
+		"XDG_RUNTIME_DIR":   true,
 	"HOME":            true,
 	"SHELL":           true,
 	"BASH_ENV":        true,
@@ -44,8 +47,9 @@ var deniedEnvKeys = map[string]bool{
 // ComposeClient handles Docker Compose operations
 type ComposeClient struct {
 	dockerSocket   string
-	composeCmd     string   // "docker" for v2, "docker-compose" for v1
-	composeArgs    []string // ["compose"] for v2, [] for v1
+	composeCmd     string   // "docker"/"podman" for v2-style, "docker-compose"/"podman-compose" for v1-style
+	composeArgs    []string // ["compose"] for v2-style, [] for v1-style
+	isPodman       bool     // true when the compose tool drives Podman (vs Docker)
 	composeChecked bool
 	apiVersion     string // Docker API version to use (for version negotiation)
 	stacksDir      string // Base directory for stack files
@@ -65,34 +69,52 @@ func (c *ComposeClient) SetAPIVersion(version string) {
 	c.apiVersion = version
 }
 
-// detectComposeCommand checks which compose command is available
-// Tries docker compose (v2) first, then docker-compose (v1)
+// detectComposeCommand checks which compose command is available.
+// A podman socket puts podman providers first; otherwise docker providers win.
 func (c *ComposeClient) detectComposeCommand() error {
 	if c.composeChecked {
 		return nil
 	}
 
-	// Try docker compose (v2) first
-	cmd := exec.Command("docker", "compose", "version")
-	if err := cmd.Run(); err == nil {
-		c.composeCmd = "docker"
-		c.composeArgs = []string{"compose"}
-		c.composeChecked = true
-		log.Debugf("Using docker compose (v2)")
-		return nil
+	type probe struct {
+		name   string
+		cmd    string
+		args   []string
+		podman bool
+	}
+	dockerFirst := []probe{
+		{"docker compose (v2)", "docker", []string{"compose"}, false},
+		{"docker-compose (v1)", "docker-compose", nil, false},
+		{"podman compose", "podman", []string{"compose"}, true},
+		{"podman-compose", "podman-compose", nil, true},
+	}
+	podmanFirst := []probe{
+		{"podman compose", "podman", []string{"compose"}, true},
+		{"podman-compose", "podman-compose", nil, true},
+		{"docker compose (v2)", "docker", []string{"compose"}, false},
+		{"docker-compose (v1)", "docker-compose", nil, false},
 	}
 
-	// Try docker-compose (v1)
-	cmd = exec.Command("docker-compose", "version")
-	if err := cmd.Run(); err == nil {
-		c.composeCmd = "docker-compose"
-		c.composeArgs = []string{}
-		c.composeChecked = true
-		log.Debugf("Using docker-compose (v1)")
-		return nil
+	// A podman socket means the Docker CLI (if present) would only be a
+	// compatibility shim — prefer native podman tooling in that case.
+	probes := dockerFirst
+	if strings.Contains(c.dockerSocket, "podman") {
+		probes = podmanFirst
 	}
 
-	return fmt.Errorf("Docker Compose is not installed. Please install either 'docker compose' (v2) or 'docker-compose' (v1)")
+	for _, p := range probes {
+		versionArgs := append(append([]string{}, p.args...), "version")
+		if err := exec.Command(p.cmd, versionArgs...).Run(); err == nil {
+			c.composeCmd = p.cmd
+			c.composeArgs = p.args
+			c.isPodman = p.podman
+			c.composeChecked = true
+			log.Debugf("Using %s", p.name)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("no compose provider found. Install 'docker compose' (v2), 'docker-compose' (v1), 'podman compose', or 'podman-compose'")
 }
 
 // RegistryCredentials holds credentials for a Docker registry
@@ -172,8 +194,16 @@ func (c *ComposeClient) loginToRegistries(ctx context.Context, registries []Regi
 
 		log.Debugf("Compose: Logging into registry %s", registryHost)
 
-		cmd := exec.CommandContext(ctx, "docker", "login", "-u", reg.Username, "--password-stdin", registryHost)
+		loginCmd := "docker"
+		if c.isPodman {
+			loginCmd = "podman"
+		}
+
+		cmd := exec.CommandContext(ctx, loginCmd, "login", "-u", reg.Username, "--password-stdin", registryHost)
 		cmd.Env = append(os.Environ(), fmt.Sprintf("DOCKER_HOST=unix://%s", c.dockerSocket))
+		if c.isPodman {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("CONTAINER_HOST=unix://%s", c.dockerSocket))
+		}
 		cmd.Stdin = strings.NewReader(reg.Password)
 
 		var stderr bytes.Buffer
@@ -520,9 +550,18 @@ func (c *ComposeClient) Execute(ctx context.Context, op *ComposeOperation, onLin
 	cmd.Env = []string{
 		fmt.Sprintf("DOCKER_HOST=unix://%s", c.dockerSocket),
 	}
+	if c.isPodman {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("CONTAINER_HOST=unix://%s", c.dockerSocket))
+	}
 	for _, key := range []string{"PATH", "HOME", "USER"} {
 		if val, ok := os.LookupEnv(key); ok {
 			cmd.Env = append(cmd.Env, key+"="+val)
+		}
+	}
+	// Rootless podman locates its auth/config store via XDG_RUNTIME_DIR.
+	if c.isPodman {
+		if val, ok := os.LookupEnv("XDG_RUNTIME_DIR"); ok {
+			cmd.Env = append(cmd.Env, "XDG_RUNTIME_DIR="+val)
 		}
 	}
 
@@ -668,15 +707,32 @@ func (c *ComposeClient) GetVersion() (string, error) {
 		return "", err
 	}
 
-	var cmd *exec.Cmd
-	if c.composeCmd == "docker" {
-		cmd = exec.Command("docker", "compose", "version", "--short")
-	} else {
-		cmd = exec.Command("docker-compose", "version", "--short")
+	var versionArgs []string
+	switch {
+	case c.composeCmd == "docker" || c.composeCmd == "podman":
+		versionArgs = append(append([]string{}, c.composeArgs...), "version", "--short")
+	default:
+		versionArgs = []string{"version", "--short"}
 	}
+	cmd := exec.Command(c.composeCmd, versionArgs...)
 	output, err := cmd.Output()
 	if err != nil {
-		return "", err
+		// podman-compose has no --short and podman compose forwards it to the
+		// provider; fall back to a plain version query.
+		output, err = exec.Command(c.composeCmd, append(append([]string{}, c.composeArgs...), "version")...).Output()
+		if err != nil {
+			return "", err
+		}
 	}
-	return strings.TrimSpace(string(output)), nil
+
+	// Strip podman-compose provider banner lines (">>>> Executing external ...").
+	var lines []string
+	for _, l := range strings.Split(string(output), "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" || strings.Contains(l, "Executing external compose provider") {
+			continue
+		}
+		lines = append(lines, l)
+	}
+	return strings.TrimSpace(strings.Join(lines, " ")), nil
 }
