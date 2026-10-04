@@ -35,6 +35,11 @@ esac
 # Detect container runtime (Docker or Podman)
 if [ -n "${HAWSER_CONTAINER_RUNTIME:-}" ]; then
     CONTAINER_RUNTIME="$HAWSER_CONTAINER_RUNTIME"
+elif [ -S /var/run/docker.sock ] && { readlink -f /var/run/docker.sock 2>/dev/null || readlink /var/run/docker.sock 2>/dev/null; } | grep -q podman; then
+    # /var/run/docker.sock is a symlink to the podman socket
+    CONTAINER_RUNTIME="podman"
+elif [ -S /run/podman/podman.sock ]; then
+    CONTAINER_RUNTIME="podman"
 elif [ -S /var/run/docker.sock ]; then
     CONTAINER_RUNTIME="docker"
 elif command -v podman &> /dev/null; then
